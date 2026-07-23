@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -27,6 +28,12 @@ class AIResult(Generic[ResultT]):
     usage: AIUsage
 
 
+@dataclass(frozen=True, slots=True)
+class AIStreamEvent:
+    delta: str | None = None
+    result: AIResult[str] | None = None
+
+
 class AIManager(ABC):
     """Единый контракт для AI-провайдеров."""
 
@@ -47,6 +54,17 @@ class AIManager(ABC):
         """Возвращает обычный текстовый ответ."""
 
     @abstractmethod
+    def stream_chat(
+        self,
+        client: AsyncOpenAI,
+        messages: list[dict[str, str]],
+        instructions: str,
+        safety_identifier: str,
+        max_output_tokens: int | None = None,
+    ) -> AsyncIterator[AIStreamEvent]:
+        """Постепенно возвращает текст и итоговые usage-метаданные."""
+
+    @abstractmethod
     async def generate_structured(
         self,
         client: AsyncOpenAI,
@@ -54,5 +72,6 @@ class AIManager(ABC):
         instructions: str,
         response_model: type[StructuredModelT],
         safety_identifier: str,
+        max_output_tokens: int | None = None,
     ) -> AIResult[StructuredModelT]:
         """Возвращает ответ, провалидированный Pydantic-моделью."""

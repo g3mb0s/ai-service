@@ -8,6 +8,7 @@ from alembic import context
 from basic_utils.models import Base
 from basic_utils.config import settings
 from domains.chat import models as chat_models  # noqa: F401
+from domains.characters import models as character_models  # noqa: F401
 from domains.exercises import models as exercise_models  # noqa: F401
 
 # this is the Alembic Config object, which provides

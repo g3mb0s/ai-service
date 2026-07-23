@@ -12,6 +12,7 @@ from basic_utils.exceptions import (
 )
 from basic_utils.openai_client import close_openai_client
 from domains.chat.routes import router as chat_router
+from domains.characters.routes import router as characters_router
 from domains.exercises.routes import router as exercises_router
 from prometheus_fastapi_instrumentator import Instrumentator
 from middleware.timing import TimingMiddleware
@@ -47,6 +48,7 @@ app.add_middleware(
 
 Instrumentator().instrument(app).expose(app)
 app.include_router(chat_router)
+app.include_router(characters_router)
 app.include_router(exercises_router)
 
 

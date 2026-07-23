@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     chat_history_limit: int = 40
     user_daily_token_limit: int = 50_000
     user_max_output_tokens_per_request: int = 8_000
+    character_response_max_output_tokens: int = 800
     
     # Настройки CORS
     allowed_origins: list[str] = ["*"]

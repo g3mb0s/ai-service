@@ -1,6 +1,9 @@
+import json
+from collections.abc import AsyncIterator
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
+from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,6 +11,7 @@ from ai.base import AIManager
 from ai.selector import get_ai_manager
 from basic_utils.auth_dependencies import AuthenticatedUser, get_current_user
 from basic_utils.database import get_async_session_generator
+from basic_utils.exceptions import AIProviderError
 from basic_utils.openai_client import get_openai_client
 from domains.chat.manager import chat_manager
 from domains.chat.schemas import (
@@ -83,3 +87,66 @@ async def send_message(
         user_message=user_message,
         assistant_message=assistant_message,
     )
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+async def stream_message(
+    conversation_id: UUID,
+    payload: SendMessageRequest,
+    session: AsyncSession = Depends(get_async_session_generator),
+    user: AuthenticatedUser = Depends(get_current_user),
+    openai_client: AsyncOpenAI = Depends(get_openai_client),
+    provider_manager: AIManager = Depends(get_ai_manager),
+) -> StreamingResponse:
+    # Preparation happens before the response starts so auth, ownership and quota
+    # errors preserve their normal HTTP status codes.
+    prepared = await chat_manager.prepare_message(
+        session,
+        conversation_id,
+        user.id,
+        user.role,
+        payload.content,
+    )
+
+    async def events() -> AsyncIterator[str]:
+        yield _sse("ready", {})
+        try:
+            async for event in chat_manager.stream_prepared_message(
+                session,
+                openai_client,
+                provider_manager,
+                user.id,
+                prepared,
+            ):
+                if event.delta is not None:
+                    yield _sse("delta", {"delta": event.delta})
+                if event.messages is not None:
+                    user_message, assistant_message = event.messages
+                    turn = ChatTurnResponse(
+                        conversation_id=conversation_id,
+                        user_message=user_message,
+                        assistant_message=assistant_message,
+                    )
+                    yield _sse("done", turn.model_dump(mode="json"))
+        except AIProviderError as exc:
+            yield _sse("error", {"message": str(exc)})
+        except Exception:
+            yield _sse(
+                "error",
+                {"message": "Не удалось завершить потоковый ответ ИИ"},
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(event: str, payload: object) -> str:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {data}\n\n"

@@ -1,6 +1,8 @@
+from collections.abc import AsyncIterator
+
 from openai import AsyncOpenAI
 
-from ai.base import AIManager, AIResult, AIUsage, StructuredModelT
+from ai.base import AIManager, AIResult, AIStreamEvent, AIUsage, StructuredModelT
 from basic_utils.config import settings
 from basic_utils.exceptions import AIProviderError
 
@@ -40,6 +42,44 @@ class ChatGPTAIManager(AIManager):
             usage=self._get_usage(response.usage),
         )
 
+    async def stream_chat(
+        self,
+        client: AsyncOpenAI,
+        messages: list[dict[str, str]],
+        instructions: str,
+        safety_identifier: str,
+        max_output_tokens: int | None = None,
+    ) -> AsyncIterator[AIStreamEvent]:
+        request: dict[str, object] = dict(
+            model=settings.openai_model,
+            instructions=instructions,
+            input=messages,
+            safety_identifier=safety_identifier,
+            store=settings.openai_store,
+        )
+        if max_output_tokens is not None:
+            request["max_output_tokens"] = max_output_tokens
+
+        async with client.responses.stream(**request) as stream:
+            async for event in stream:
+                if event.type == "response.output_text.delta" and event.delta:
+                    yield AIStreamEvent(delta=event.delta)
+            response = await stream.get_final_response()
+
+        content = response.output_text.strip()
+        if not content:
+            raise AIProviderError("OpenAI returned an empty response")
+        yield AIStreamEvent(
+            result=AIResult(
+                data=content,
+                provider=self.provider,
+                provider_host=settings.openai_base_url,
+                model=response.model or settings.openai_model,
+                response_id=response.id,
+                usage=self._get_usage(response.usage),
+            )
+        )
+
     async def generate_structured(
         self,
         client: AsyncOpenAI,
@@ -47,8 +87,9 @@ class ChatGPTAIManager(AIManager):
         instructions: str,
         response_model: type[StructuredModelT],
         safety_identifier: str,
+        max_output_tokens: int | None = None,
     ) -> AIResult[StructuredModelT]:
-        response = await client.responses.parse(
+        request: dict[str, object] = dict(
             model=settings.openai_model,
             instructions=instructions,
             input=input_text,
@@ -56,6 +97,9 @@ class ChatGPTAIManager(AIManager):
             safety_identifier=safety_identifier,
             store=settings.openai_store,
         )
+        if max_output_tokens is not None:
+            request["max_output_tokens"] = max_output_tokens
+        response = await client.responses.parse(**request)
         if response.output_parsed is None:
             raise AIProviderError("OpenAI did not return structured data")
         return AIResult(

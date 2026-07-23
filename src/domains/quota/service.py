@@ -4,12 +4,13 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from basic_utils.config import settings
 from basic_utils.exceptions import DailyTokenLimitError
 from domains.chat.models import ChatMessage, Conversation
+from domains.characters.models import CharacterConversation, CharacterMessage
 
 
 class TokenQuotaService:
@@ -38,8 +39,8 @@ class TokenQuotaService:
             select(func.pg_advisory_xact_lock(self._lock_key(user_id, day_start)))
         )
 
-        result = await session.execute(
-            select(func.coalesce(func.sum(ChatMessage.total_tokens), 0))
+        regular_chat_usage = (
+            select(ChatMessage.total_tokens.label("total_tokens"))
             .join(Conversation, Conversation.id == ChatMessage.conversation_id)
             .where(
                 Conversation.user_id == user_id,
@@ -47,6 +48,23 @@ class TokenQuotaService:
                 ChatMessage.created_at >= day_start,
                 ChatMessage.created_at < day_end,
             )
+        )
+        character_chat_usage = (
+            select(CharacterMessage.total_tokens.label("total_tokens"))
+            .join(
+                CharacterConversation,
+                CharacterConversation.id == CharacterMessage.conversation_id,
+            )
+            .where(
+                CharacterConversation.user_id == user_id,
+                CharacterMessage.role == "assistant",
+                CharacterMessage.created_at >= day_start,
+                CharacterMessage.created_at < day_end,
+            )
+        )
+        all_usage = union_all(regular_chat_usage, character_chat_usage).subquery()
+        result = await session.execute(
+            select(func.coalesce(func.sum(all_usage.c.total_tokens), 0))
         )
         used_tokens = int(result.scalar_one())
         remaining_tokens = settings.user_daily_token_limit - used_tokens

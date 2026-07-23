@@ -4,9 +4,9 @@ from uuid import uuid4
 
 import pytest
 
-from ai.base import AIResult, AIUsage
+from ai.base import AIResult, AIStreamEvent, AIUsage
 from domains.chat import manager as manager_module
-from domains.chat.manager import chat_manager
+from domains.chat.manager import CHAT_INSTRUCTIONS, PreparedChatMessage, chat_manager
 from domains.chat.models import Conversation
 
 
@@ -111,3 +111,130 @@ def test_missing_provider_usage_is_conservatively_accounted() -> None:
         messages,
         None,
     ) is None
+
+
+def test_chat_prompt_is_scoped_to_learning_english() -> None:
+    assert "sole purpose" in CHAT_INSTRUCTIONS
+    assert "learn, practise, and improve English" in CHAT_INSTRUCTIONS
+    assert "always include useful English" in CHAT_INSTRUCTIONS
+    assert "unrelated" in CHAT_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_streamed_message_is_persisted_after_final_event() -> None:
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    conversation = Conversation(
+        id=uuid4(),
+        user_id=uuid4(),
+        title="Новый диалог",
+        messages=[],
+    )
+    prepared = PreparedChatMessage(
+        conversation=conversation,
+        user_message=manager_module.ChatMessage(
+            conversation_id=conversation.id,
+            role="user",
+            content="Question",
+        ),
+        user_role="user",
+        openai_input=[{"role": "user", "content": "Question"}],
+        max_output_tokens=500,
+    )
+    final_result = AIResult(
+        data="Streamed answer",
+        provider="test-provider",
+        provider_host="https://provider.test",
+        model="test-model",
+        response_id="resp_stream",
+        usage=AIUsage(input_tokens=4, output_tokens=2, total_tokens=6),
+    )
+
+    async def stream_chat(**_kwargs):
+        yield AIStreamEvent(delta="Streamed ")
+        yield AIStreamEvent(delta="answer")
+        yield AIStreamEvent(result=final_result)
+
+    provider_manager = SimpleNamespace(
+        provider="test-provider",
+        stream_chat=stream_chat,
+    )
+    add_message = MagicMock()
+    original_add_message = manager_module.chat_service.add_message
+    manager_module.chat_service.add_message = add_message
+    try:
+        events = [
+            event
+            async for event in chat_manager.stream_prepared_message(
+                session,
+                SimpleNamespace(),
+                provider_manager,
+                conversation.user_id,
+                prepared,
+            )
+        ]
+    finally:
+        manager_module.chat_service.add_message = original_add_message
+
+    assert [event.delta for event in events[:2]] == ["Streamed ", "answer"]
+    assert events[-1].messages is not None
+    assert events[-1].messages[1].content == "Streamed answer"
+    add_message.assert_called_once()
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_stream_is_persisted_and_accounted() -> None:
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    conversation = Conversation(
+        id=uuid4(),
+        user_id=uuid4(),
+        title="Новый диалог",
+        messages=[],
+    )
+    prepared = PreparedChatMessage(
+        conversation=conversation,
+        user_message=manager_module.ChatMessage(
+            conversation_id=conversation.id,
+            role="user",
+            content="Question",
+        ),
+        user_role="user",
+        openai_input=[{"role": "user", "content": "Question"}],
+        max_output_tokens=500,
+    )
+
+    async def stream_chat(**_kwargs):
+        yield AIStreamEvent(delta="Partial answer")
+        yield AIStreamEvent(delta=" that should not arrive")
+
+    provider_manager = SimpleNamespace(
+        provider="test-provider",
+        stream_chat=stream_chat,
+    )
+    add_message = MagicMock()
+    original_add_message = manager_module.chat_service.add_message
+    manager_module.chat_service.add_message = add_message
+    try:
+        stream = chat_manager.stream_prepared_message(
+            session,
+            SimpleNamespace(),
+            provider_manager,
+            conversation.user_id,
+            prepared,
+        )
+        first = await anext(stream)
+        await stream.aclose()
+    finally:
+        manager_module.chat_service.add_message = original_add_message
+
+    assert first.delta == "Partial answer"
+    assistant_message = add_message.call_args.args[1]
+    assert assistant_message.content == "Partial answer"
+    assert assistant_message.total_tokens > 500
+    session.commit.assert_awaited_once()
