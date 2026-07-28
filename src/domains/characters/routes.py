@@ -1,6 +1,8 @@
-from uuid import UUID
+import logging
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,9 +27,43 @@ from domains.characters.schemas import (
     CreateCharacterConversationRequest,
     SendCharacterMessageRequest,
 )
+from infrastructure.object_storage import ObjectStorage, get_object_storage
 
 
 router = APIRouter(tags=["characters"])
+logger = logging.getLogger(__name__)
+MAX_AVATAR_BYTES = 5 * 1024 * 1024
+AVATAR_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+
+
+def _matches_image_signature(content: bytes, content_type: str) -> bool:
+    if content_type == "image/jpeg":
+        return content.startswith(b"\xff\xd8\xff")
+    if content_type == "image/png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    if content_type == "image/webp":
+        return (
+            len(content) >= 12
+            and content.startswith(b"RIFF")
+            and content[8:12] == b"WEBP"
+        )
+    return False
+
+
+async def _remove_object_quietly(
+    storage: ObjectStorage,
+    object_key: str | None,
+) -> None:
+    if not object_key:
+        return
+    try:
+        await run_in_threadpool(storage.remove, object_key)
+    except Exception:
+        logger.exception("Failed to remove object %s", object_key)
 
 
 @router.get("/characters", response_model=list[CharacterResponse])
@@ -100,6 +136,86 @@ async def update_admin_character(
     )
 
 
+@router.put(
+    "/admin/characters/{character_id}/avatar",
+    response_model=CharacterAdminResponse,
+)
+async def update_admin_character_avatar(
+    character_id: str,
+    avatar: UploadFile = File(...),
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> CharacterAdminResponse:
+    extension = AVATAR_EXTENSIONS.get(avatar.content_type or "")
+    if extension is None:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Avatar must be a JPEG, PNG, or WebP image",
+        )
+    content = await avatar.read(MAX_AVATAR_BYTES + 1)
+    await avatar.close()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Avatar file is empty",
+        )
+    if len(content) > MAX_AVATAR_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Avatar must not exceed 5 MB",
+        )
+    if not _matches_image_signature(content, avatar.content_type):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="File content does not match its image type",
+        )
+
+    character = await character_chat_manager.get_character(session, character_id)
+    previous_key = character.avatar_object_key
+    object_key = f"characters/{character_id}/{uuid4().hex}.{extension}"
+    avatar_url = await run_in_threadpool(
+        storage.put,
+        object_key,
+        content,
+        avatar.content_type,
+    )
+    try:
+        character = await character_chat_manager.update_character_avatar(
+            session,
+            character,
+            avatar_url=avatar_url,
+            avatar_object_key=object_key,
+        )
+    except Exception:
+        await _remove_object_quietly(storage, object_key)
+        raise
+    await _remove_object_quietly(storage, previous_key)
+    return character
+
+
+@router.delete(
+    "/admin/characters/{character_id}/avatar",
+    response_model=CharacterAdminResponse,
+)
+async def delete_admin_character_avatar(
+    character_id: str,
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+    storage: ObjectStorage = Depends(get_object_storage),
+) -> CharacterAdminResponse:
+    character = await character_chat_manager.get_character(session, character_id)
+    previous_key = character.avatar_object_key
+    character = await character_chat_manager.update_character_avatar(
+        session,
+        character,
+        avatar_url=None,
+        avatar_object_key=None,
+    )
+    await _remove_object_quietly(storage, previous_key)
+    return character
+
+
 @router.delete(
     "/admin/characters/{character_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -108,7 +224,10 @@ async def delete_admin_character(
     character_id: str,
     session: AsyncSession = Depends(get_async_session_generator),
     _admin: AuthenticatedUser = Depends(get_admin),
+    storage: ObjectStorage = Depends(get_object_storage),
 ) -> Response:
+    character = await character_chat_manager.get_character(session, character_id)
+    avatar_object_key = character.avatar_object_key
     try:
         await character_chat_manager.delete_character(session, character_id)
     except ValueError as exc:
@@ -116,6 +235,7 @@ async def delete_admin_character(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from exc
+    await _remove_object_quietly(storage, avatar_object_key)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

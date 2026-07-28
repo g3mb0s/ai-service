@@ -75,6 +75,21 @@ class CharacterChatManager:
         await session.commit()
         return character
 
+    async def update_character_avatar(
+        self,
+        session: AsyncSession,
+        character: Character,
+        *,
+        avatar_url: str | None,
+        avatar_object_key: str | None,
+    ) -> Character:
+        character.avatar_url = avatar_url
+        character.avatar_object_key = avatar_object_key
+        await session.flush()
+        await session.refresh(character)
+        await session.commit()
+        return character
+
     async def delete_character(
         self,
         session: AsyncSession,

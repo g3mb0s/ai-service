@@ -28,6 +28,8 @@ class Character(Base):
     greeting: Mapped[str] = mapped_column(String(500), nullable=False)
     disclaimer: Mapped[str] = mapped_column(String(500), nullable=False)
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    avatar_url: Mapped[str | None] = mapped_column(String(1000))
+    avatar_object_key: Mapped[str | None] = mapped_column(String(500))
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=True,

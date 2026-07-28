@@ -14,6 +14,7 @@ class CharacterResponse(BaseModel):
     description: str
     greeting: str
     disclaimer: str
+    avatar_url: str | None
 
 
 class CharacterAdminResponse(CharacterResponse):
