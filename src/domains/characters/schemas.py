@@ -7,11 +7,47 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CharacterResponse(BaseModel):
-    id: Literal["messi"]
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
     name: str
     description: str
     greeting: str
     disclaimer: str
+
+
+class CharacterAdminResponse(CharacterResponse):
+    instructions: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class CharacterCreateRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    id: str = Field(
+        min_length=2,
+        max_length=50,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    greeting: str = Field(min_length=1, max_length=500)
+    disclaimer: str = Field(min_length=1, max_length=500)
+    instructions: str = Field(min_length=20, max_length=20_000)
+    is_active: bool = True
+
+
+class CharacterUpdateRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    greeting: str = Field(min_length=1, max_length=500)
+    disclaimer: str = Field(min_length=1, max_length=500)
+    instructions: str = Field(min_length=20, max_length=20_000)
+    is_active: bool
 
 
 class CreateCharacterConversationRequest(BaseModel):

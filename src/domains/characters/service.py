@@ -1,13 +1,60 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from domains.characters.models import CharacterConversation, CharacterMessage
+from domains.characters.models import Character, CharacterConversation, CharacterMessage
 
 
 class CharacterChatService:
+    def add_character(self, session: AsyncSession, character: Character) -> None:
+        session.add(character)
+
+    async def get_character(
+        self,
+        session: AsyncSession,
+        character_id: str,
+        *,
+        active_only: bool = False,
+    ) -> Character | None:
+        query = select(Character).where(Character.id == character_id)
+        if active_only:
+            query = query.where(Character.is_active.is_(True))
+        result = await session.execute(query)
+        return result.scalar_one_or_none()
+
+    async def list_characters(
+        self,
+        session: AsyncSession,
+        *,
+        active_only: bool,
+    ) -> list[Character]:
+        query = select(Character)
+        if active_only:
+            query = query.where(Character.is_active.is_(True))
+        result = await session.execute(query.order_by(Character.name, Character.id))
+        return list(result.scalars().all())
+
+    async def count_conversations(
+        self,
+        session: AsyncSession,
+        character_id: str,
+    ) -> int:
+        result = await session.execute(
+            select(func.count(CharacterConversation.id)).where(
+                CharacterConversation.character_id == character_id
+            )
+        )
+        return int(result.scalar_one())
+
+    async def delete_character(
+        self,
+        session: AsyncSession,
+        character: Character,
+    ) -> None:
+        await session.delete(character)
+
     def add_conversation(
         self,
         session: AsyncSession,

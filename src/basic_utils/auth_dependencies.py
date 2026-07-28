@@ -171,3 +171,16 @@ async def get_manager_or_admin(
             detail="Manager or admin role is required",
         )
     return user
+
+
+async def get_admin(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> AuthenticatedUser:
+    """Разрешает доступ только администраторам."""
+
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role is required",
+        )
+    return user

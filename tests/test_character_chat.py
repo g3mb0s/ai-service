@@ -8,8 +8,8 @@ from pydantic import ValidationError
 from ai.base import AIResult, AIUsage
 from domains.characters import manager as manager_module
 from domains.characters.manager import character_chat_manager
-from domains.characters.models import CharacterConversation
-from domains.characters.schemas import CharacterAIResponse
+from domains.characters.models import Character, CharacterConversation
+from domains.characters.schemas import CharacterAIResponse, CharacterUpdateRequest
 
 
 def test_perfect_message_has_no_feedback() -> None:
@@ -86,6 +86,21 @@ async def test_character_turn_persists_rating_and_short_reply(
         "get_conversation",
         AsyncMock(return_value=conversation),
     )
+    monkeypatch.setattr(
+        manager_module.character_chat_service,
+        "get_character",
+        AsyncMock(
+            return_value=Character(
+                id="messi",
+                name="Lionel Messi",
+                description="Football practice",
+                greeting="Hello",
+                disclaimer="Fictional AI roleplay",
+                instructions="Use the dynamic instructions from the database.",
+                is_active=True,
+            )
+        ),
+    )
     add_message = MagicMock()
     monkeypatch.setattr(
         manager_module.character_chat_service,
@@ -141,11 +156,80 @@ async def test_character_turn_persists_rating_and_short_reply(
         ai_manager.generate_structured.await_args.kwargs["response_model"]
         is CharacterAIResponse
     )
+    assert (
+        ai_manager.generate_structured.await_args.kwargs["instructions"]
+        == "Use the dynamic instructions from the database."
+    )
 
 
-def test_messi_is_clearly_marked_as_ai_roleplay() -> None:
-    character = character_chat_manager.get_character("messi")
+@pytest.mark.asyncio
+async def test_character_prompt_is_loaded_from_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    character = Character(
+        id="detective",
+        name="Detective",
+        description="Mystery practice",
+        greeting="What did you notice?",
+        disclaimer="Fictional AI roleplay",
+        instructions="Use this editable prompt from the database.",
+        is_active=True,
+    )
+    get_character = AsyncMock(return_value=character)
+    monkeypatch.setattr(
+        manager_module.character_chat_service,
+        "get_character",
+        get_character,
+    )
 
-    assert "fictional AI" in character.disclaimer
-    assert "strictly in English" in character.instructions
-    assert "one to three short sentences" in character.instructions
+    result = await character_chat_manager.get_character(
+        MagicMock(),
+        "detective",
+        active_only=True,
+    )
+
+    assert result.instructions == "Use this editable prompt from the database."
+    get_character.assert_awaited_once()
+    assert get_character.await_args.kwargs["active_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_updated_character_is_refreshed_before_response_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    character = Character(
+        id="messi",
+        name="Lionel Messi",
+        description="Football practice",
+        greeting="Hello",
+        disclaimer="Fictional AI roleplay",
+        instructions="Use the original database prompt.",
+        is_active=True,
+    )
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+    session.commit = AsyncMock()
+    monkeypatch.setattr(
+        character_chat_manager,
+        "get_character",
+        AsyncMock(return_value=character),
+    )
+
+    result = await character_chat_manager.update_character(
+        session,
+        "messi",
+        CharacterUpdateRequest(
+            name="Updated Messi",
+            description="Updated football practice",
+            greeting="Hi!",
+            disclaimer="Fictional AI roleplay",
+            instructions="Use the updated database prompt.",
+            is_active=True,
+        ),
+    )
+
+    assert result.name == "Updated Messi"
+    session.flush.assert_awaited_once()
+    session.refresh.assert_awaited_once_with(character)
+    session.commit.assert_awaited_once()

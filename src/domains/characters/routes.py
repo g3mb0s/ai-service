@@ -1,20 +1,27 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai.base import AIManager
 from ai.selector import get_ai_manager
-from basic_utils.auth_dependencies import AuthenticatedUser, get_current_user
+from basic_utils.auth_dependencies import (
+    AuthenticatedUser,
+    get_admin,
+    get_current_user,
+)
 from basic_utils.database import get_async_session_generator
 from basic_utils.openai_client import get_openai_client
 from domains.characters.manager import character_chat_manager
 from domains.characters.schemas import (
     CharacterConversationResponse,
     CharacterConversationSummaryResponse,
+    CharacterAdminResponse,
+    CharacterCreateRequest,
     CharacterResponse,
     CharacterTurnResponse,
+    CharacterUpdateRequest,
     CreateCharacterConversationRequest,
     SendCharacterMessageRequest,
 )
@@ -25,9 +32,91 @@ router = APIRouter(tags=["characters"])
 
 @router.get("/characters", response_model=list[CharacterResponse])
 async def list_characters(
+    session: AsyncSession = Depends(get_async_session_generator),
     _user: AuthenticatedUser = Depends(get_current_user),
 ) -> list[CharacterResponse]:
-    return character_chat_manager.list_characters()
+    return await character_chat_manager.list_characters(session)
+
+
+@router.get(
+    "/admin/characters",
+    response_model=list[CharacterAdminResponse],
+)
+async def list_admin_characters(
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+) -> list[CharacterAdminResponse]:
+    return await character_chat_manager.list_characters(
+        session,
+        active_only=False,
+    )
+
+
+@router.get(
+    "/admin/characters/{character_id}",
+    response_model=CharacterAdminResponse,
+)
+async def get_admin_character(
+    character_id: str,
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+) -> CharacterAdminResponse:
+    return await character_chat_manager.get_character(session, character_id)
+
+
+@router.post(
+    "/admin/characters",
+    response_model=CharacterAdminResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_admin_character(
+    payload: CharacterCreateRequest,
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+) -> CharacterAdminResponse:
+    try:
+        return await character_chat_manager.create_character(session, payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@router.put(
+    "/admin/characters/{character_id}",
+    response_model=CharacterAdminResponse,
+)
+async def update_admin_character(
+    character_id: str,
+    payload: CharacterUpdateRequest,
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+) -> CharacterAdminResponse:
+    return await character_chat_manager.update_character(
+        session,
+        character_id,
+        payload,
+    )
+
+
+@router.delete(
+    "/admin/characters/{character_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_admin_character(
+    character_id: str,
+    session: AsyncSession = Depends(get_async_session_generator),
+    _admin: AuthenticatedUser = Depends(get_admin),
+) -> Response:
+    try:
+        await character_chat_manager.delete_character(session, character_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

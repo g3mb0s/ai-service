@@ -1,6 +1,5 @@
 import hashlib
 import json
-from dataclasses import dataclass
 from uuid import UUID
 
 import openai
@@ -10,61 +9,88 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai.base import AIManager
 from basic_utils.config import settings
 from basic_utils.exceptions import AIProviderError, EntityNotFoundError
-from domains.characters.models import CharacterConversation, CharacterMessage
-from domains.characters.schemas import CharacterAIResponse, CharacterResponse
+from domains.characters.models import Character, CharacterConversation, CharacterMessage
+from domains.characters.schemas import (
+    CharacterAIResponse,
+    CharacterCreateRequest,
+    CharacterUpdateRequest,
+)
 from domains.characters.service import character_chat_service
 from domains.quota.service import token_quota_service
 
 
-@dataclass(frozen=True, slots=True)
-class CharacterDefinition:
-    id: str
-    name: str
-    description: str
-    greeting: str
-    disclaimer: str
-    instructions: str
-
-
-MESSI = CharacterDefinition(
-    id="messi",
-    name="Lionel Messi",
-    description="Practise everyday English with a calm football legend.",
-    greeting="Hi! Let’s talk in English. You can ask me about football, training, goals, or daily life.",
-    disclaimer="This is a fictional AI roleplay, not Lionel Messi or his representative.",
-    instructions=(
-        "Roleplay as a clearly fictional AI character inspired by Lionel Messi's "
-        "widely known public football persona. Never claim to be the real person, "
-        "never invent private information, and do not imply endorsement. "
-        "The purpose is relaxed English conversation practice. Communicate strictly "
-        "in English, even when the user writes in another language. Stay warm, calm, "
-        "humble, and interested in football, training, teamwork, family-friendly daily "
-        "life, and motivation. Keep the character reply in text to one to three short "
-        "sentences. Ask at most one natural follow-up question. "
-        "Evaluate only the English quality of the user's latest message. quality must "
-        "be an integer from 0 to 10. If the message is natural and correct, use 10 and "
-        "set correction and comment to empty strings. If it contains any meaningful "
-        "grammar, word-choice, spelling, or naturalness issue, use 0-9, put the full "
-        "natural corrected message in correction, and give a short grammar explanation "
-        "in English in comment. If no correction is needed, correction and comment must "
-        "both be empty. Never fill only one of those fields. The comment must be no more "
-        "than three short sentences. "
-        "Return only the structured object required by the schema."
-    ),
-)
-
-CHARACTERS = {MESSI.id: MESSI}
-
-
 class CharacterChatManager:
-    def list_characters(self) -> list[CharacterResponse]:
-        return [self._response(character) for character in CHARACTERS.values()]
+    async def list_characters(
+        self,
+        session: AsyncSession,
+        *,
+        active_only: bool = True,
+    ) -> list[Character]:
+        return await character_chat_service.list_characters(
+            session,
+            active_only=active_only,
+        )
 
-    def get_character(self, character_id: str) -> CharacterDefinition:
-        character = CHARACTERS.get(character_id)
+    async def get_character(
+        self,
+        session: AsyncSession,
+        character_id: str,
+        *,
+        active_only: bool = False,
+    ) -> Character:
+        character = await character_chat_service.get_character(
+            session,
+            character_id,
+            active_only=active_only,
+        )
         if character is None:
             raise EntityNotFoundError("Character not found")
         return character
+
+    async def create_character(
+        self,
+        session: AsyncSession,
+        payload: CharacterCreateRequest,
+    ) -> Character:
+        existing = await character_chat_service.get_character(session, payload.id)
+        if existing is not None:
+            raise ValueError("A character with this ID already exists")
+        character = Character(**payload.model_dump())
+        character_chat_service.add_character(session, character)
+        await session.flush()
+        await session.commit()
+        return character
+
+    async def update_character(
+        self,
+        session: AsyncSession,
+        character_id: str,
+        payload: CharacterUpdateRequest,
+    ) -> Character:
+        character = await self.get_character(session, character_id)
+        for field, value in payload.model_dump().items():
+            setattr(character, field, value)
+        await session.flush()
+        await session.refresh(character)
+        await session.commit()
+        return character
+
+    async def delete_character(
+        self,
+        session: AsyncSession,
+        character_id: str,
+    ) -> None:
+        character = await self.get_character(session, character_id)
+        conversation_count = await character_chat_service.count_conversations(
+            session,
+            character_id,
+        )
+        if conversation_count:
+            raise ValueError(
+                "Character has conversations and cannot be deleted; deactivate it instead"
+            )
+        await character_chat_service.delete_character(session, character)
+        await session.commit()
 
     async def create_conversation(
         self,
@@ -72,7 +98,7 @@ class CharacterChatManager:
         character_id: str,
         user_id: UUID,
     ) -> CharacterConversation:
-        character = self.get_character(character_id)
+        character = await self.get_character(session, character_id, active_only=True)
         conversation = CharacterConversation(
             user_id=user_id,
             character_id=character.id,
@@ -89,7 +115,7 @@ class CharacterChatManager:
         character_id: str,
         user_id: UUID,
     ) -> list[CharacterConversation]:
-        self.get_character(character_id)
+        await self.get_character(session, character_id, active_only=True)
         return await character_chat_service.list_conversations(
             session,
             character_id,
@@ -109,7 +135,7 @@ class CharacterChatManager:
         )
         if conversation is None:
             raise EntityNotFoundError("Character conversation not found")
-        self.get_character(conversation.character_id)
+        await self.get_character(session, conversation.character_id)
         return conversation
 
     async def send_message(
@@ -123,7 +149,7 @@ class CharacterChatManager:
         content: str,
     ) -> tuple[CharacterMessage, CharacterMessage]:
         conversation = await self.get_conversation(session, conversation_id, user_id)
-        character = self.get_character(conversation.character_id)
+        character = await self.get_character(session, conversation.character_id)
         clean_content = content.strip()
         user_message = CharacterMessage(
             conversation_id=conversation.id,
@@ -245,15 +271,5 @@ class CharacterChatManager:
         if isinstance(exc, openai.APIStatusError):
             return f"{ai_manager.provider} returned HTTP {exc.status_code}: {exc}"
         return f"{ai_manager.provider} request failed: {exc}"
-
-    def _response(self, character: CharacterDefinition) -> CharacterResponse:
-        return CharacterResponse(
-            id="messi",
-            name=character.name,
-            description=character.description,
-            greeting=character.greeting,
-            disclaimer=character.disclaimer,
-        )
-
 
 character_chat_manager = CharacterChatManager()
