@@ -65,6 +65,18 @@ def test_lower_score_without_grammar_error_can_have_empty_feedback() -> None:
     assert response.rate.correction == ""
 
 
+def test_null_feedback_fields_are_coerced_to_empty_strings() -> None:
+    response = CharacterAIResponse.model_validate(
+        {
+            "text": "I train every day.",
+            "rate": {"quality": 6, "correction": None, "comment": None},
+        }
+    )
+
+    assert response.rate.correction == ""
+    assert response.rate.comment == ""
+
+
 @pytest.mark.asyncio
 async def test_character_turn_persists_rating_and_short_reply(
     monkeypatch: pytest.MonkeyPatch,
@@ -95,7 +107,6 @@ async def test_character_turn_persists_rating_and_short_reply(
                 name="Lionel Messi",
                 description="Football practice",
                 greeting="Hello",
-                disclaimer="Fictional AI roleplay",
                 instructions="Use the dynamic instructions from the database.",
                 is_active=True,
             )
@@ -171,7 +182,6 @@ async def test_character_prompt_is_loaded_from_database(
         name="Detective",
         description="Mystery practice",
         greeting="What did you notice?",
-        disclaimer="Fictional AI roleplay",
         instructions="Use this editable prompt from the database.",
         is_active=True,
     )
@@ -202,7 +212,6 @@ async def test_updated_character_is_refreshed_before_response_serialization(
         name="Lionel Messi",
         description="Football practice",
         greeting="Hello",
-        disclaimer="Fictional AI roleplay",
         instructions="Use the original database prompt.",
         is_active=True,
     )
@@ -223,7 +232,6 @@ async def test_updated_character_is_refreshed_before_response_serialization(
             name="Updated Messi",
             description="Updated football practice",
             greeting="Hi!",
-            disclaimer="Fictional AI roleplay",
             instructions="Use the updated database prompt.",
             is_active=True,
         ),

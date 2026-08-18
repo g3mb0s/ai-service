@@ -105,52 +105,100 @@ class DeepSeekAIManager(AIManager):
         safety_identifier: str,
         max_output_tokens: int | None = None,
     ) -> AIResult[StructuredModelT]:
-        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        schema_obj = response_model.model_json_schema()
+        schema = json.dumps(schema_obj, ensure_ascii=False)
+        system_content = (
+            f"{instructions}\n\n"
+            "Return your answer as a single valid JSON object and nothing else. "
+            "Do not wrap it in markdown code fences. Do not add any explanation, "
+            "comment, or prose before or after the JSON object. Use exactly the "
+            "field names and value types declared in the JSON Schema below: strings "
+            "as JSON strings, integers as JSON integers, and null only where the "
+            "schema explicitly allows it.\n"
+            f"JSON Schema: {schema}"
+        )
+        examples = schema_obj.get("examples")
+        if examples:
+            system_content += (
+                "\nExample of a valid response:\n"
+                + json.dumps(examples[0], ensure_ascii=False)
+            )
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": input_text},
+        ]
         request: dict[str, object] = dict(
             model=settings.openai_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"{instructions}\nReturn only a valid JSON object matching "
-                        f"this JSON Schema: {schema}"
-                    ),
-                },
-                {"role": "user", "content": input_text},
-            ],
+            messages=messages,
             response_format={"type": "json_object"},
             user=safety_identifier,
         )
         if max_output_tokens is not None:
             request["max_tokens"] = max_output_tokens
-        completion = await client.chat.completions.create(**request)
-        content = completion.choices[0].message.content
-        if not content or not content.strip():
-            raise AIProviderError("DeepSeek returned an empty structured response")
-        try:
-            parsed = response_model.model_validate_json(
-                self._extract_json_object(content)
-            )
-        except ValidationError as exc:
-            logger.warning(
-                "Structured response validation failed",
-                {
-                    "schema": response_model.__name__,
-                    "errors": exc.errors(include_url=False, include_input=False),
-                },
-            )
-            raise AIProviderError(
-                f"DeepSeek returned invalid structured data for "
-                f"{response_model.__name__}"
-            ) from exc
-        return AIResult(
-            data=parsed,
-            provider=self.provider,
-            provider_host=settings.openai_base_url,
-            model=completion.model or settings.openai_model,
-            response_id=completion.id,
-            usage=self._get_usage(completion.usage),
+
+        last_error: ValidationError | None = None
+        for attempt in range(2):
+            completion = await client.chat.completions.create(**request)
+            content = completion.choices[0].message.content
+            if not content or not content.strip():
+                if attempt == 0:
+                    request["messages"] = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response was empty. Reply again with "
+                                "only the valid JSON object."
+                            ),
+                        },
+                    ]
+                    continue
+                raise AIProviderError(
+                    "DeepSeek returned an empty structured response"
+                )
+            try:
+                parsed = response_model.model_validate_json(
+                    self._extract_json_object(content)
+                )
+                return AIResult(
+                    data=parsed,
+                    provider=self.provider,
+                    provider_host=settings.openai_base_url,
+                    model=completion.model or settings.openai_model,
+                    response_id=completion.id,
+                    usage=self._get_usage(completion.usage),
+                )
+            except ValidationError as exc:
+                last_error = exc
+                if attempt == 0:
+                    request["messages"] = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response was not a valid JSON object "
+                                "matching the schema. Reply again with only the "
+                                "valid JSON object, using the exact field names and "
+                                "value types from the schema."
+                            ),
+                        },
+                    ]
+                    continue
+        logger.warning(
+            "Structured response validation failed",
+            {
+                "schema": response_model.__name__,
+                "errors": (
+                    last_error.errors(include_url=False, include_input=False)
+                    if last_error is not None
+                    else []
+                ),
+            },
         )
+        raise AIProviderError(
+            f"DeepSeek returned invalid structured data for "
+            f"{response_model.__name__}"
+        ) from last_error
 
     def _extract_json_object(self, content: str) -> str:
         cleaned = content.strip()

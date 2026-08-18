@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class CharacterResponse(BaseModel):
@@ -13,18 +13,44 @@ class CharacterResponse(BaseModel):
     name: str
     description: str
     greeting: str
-    disclaimer: str
     avatar_url: str | None
 
 
 class CharacterAdminResponse(CharacterResponse):
-    instructions: str
+    instructions: str | None
+    character_prompt: str | None
     is_active: bool
     created_at: datetime
     updated_at: datetime
 
 
-class CharacterCreateRequest(BaseModel):
+class CharacterPromptFields(BaseModel):
+    """Shared prompt fields for the two request models.
+
+    Both fields are optional in the wire format: an empty/whitespace string is
+    normalised to ``None`` (``mode="before"``, so ``"  "`` never fails the
+    ``min_length`` constraint), and ``None`` means "field not provided".
+    """
+
+    instructions: str | None = Field(default=None, min_length=20, max_length=20_000)
+    character_prompt: str | None = Field(default=None, min_length=1, max_length=2_000)
+
+    @field_validator("instructions", "character_prompt", mode="before")
+    @classmethod
+    def empty_prompt_to_none(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # pydantic v2 lax mode does not coerce non-strings to str (unlike
+            # v1), so coerce explicitly; this keeps e.g. a JSON number 123 from
+            # causing a 500 and makes it accepted as "123".
+            return str(value)
+        if not value.strip():
+            return None
+        return value
+
+
+class CharacterCreateRequest(CharacterPromptFields):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     id: str = Field(
@@ -35,20 +61,31 @@ class CharacterCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(min_length=1, max_length=500)
     greeting: str = Field(min_length=1, max_length=500)
-    disclaimer: str = Field(min_length=1, max_length=500)
-    instructions: str = Field(min_length=20, max_length=20_000)
     is_active: bool = True
 
+    @model_validator(mode="after")
+    def validate_prompt_fields(self) -> "CharacterCreateRequest":
+        if self.character_prompt is not None and self.instructions is not None:
+            raise ValueError("provide either character_prompt or instructions, not both")
+        if self.character_prompt is None and self.instructions is None:
+            raise ValueError("character_prompt or instructions is required")
+        return self
 
-class CharacterUpdateRequest(BaseModel):
+
+class CharacterUpdateRequest(CharacterPromptFields):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(min_length=1, max_length=500)
     greeting: str = Field(min_length=1, max_length=500)
-    disclaimer: str = Field(min_length=1, max_length=500)
-    instructions: str = Field(min_length=20, max_length=20_000)
     is_active: bool
+
+    @model_validator(mode="after")
+    def validate_prompt_fields(self) -> "CharacterUpdateRequest":
+        if self.character_prompt is not None and self.instructions is not None:
+            raise ValueError("provide either character_prompt or instructions, not both")
+        # Both fields None is allowed: "keep the existing prompt".
+        return self
 
 
 class CreateCharacterConversationRequest(BaseModel):
@@ -66,6 +103,13 @@ class CharacterRate(BaseModel):
     correction: str = Field(max_length=300)
     comment: str = Field(max_length=400)
 
+    @field_validator("correction", "comment", mode="before")
+    @classmethod
+    def null_feedback_to_empty(cls, value: object) -> object:
+        if value is None:
+            return ""
+        return value
+
     @model_validator(mode="after")
     def validate_feedback(self) -> "CharacterRate":
         correction = self.correction.strip()
@@ -81,7 +125,17 @@ class CharacterRate(BaseModel):
 
 
 class CharacterAIResponse(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "text": "Nice to meet you! What would you like to talk about?",
+                    "rate": {"quality": 10, "correction": "", "comment": ""},
+                }
+            ]
+        },
+    )
 
     text: str = Field(min_length=1, max_length=500)
     rate: CharacterRate

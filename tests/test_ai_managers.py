@@ -187,6 +187,86 @@ async def test_deepseek_accepts_json_wrapped_in_markdown_fence() -> None:
     assert result.data.answer == "structured"
 
 
+@pytest.mark.asyncio
+async def test_deepseek_retries_once_when_structured_response_is_invalid() -> None:
+    bad = SimpleNamespace(
+        id="resp_bad",
+        model="deepseek-test",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))],
+        usage=None,
+    )
+    good = SimpleNamespace(
+        id="resp_good",
+        model="deepseek-test",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content='{"answer":"fixed"}')
+            )
+        ],
+        usage=None,
+    )
+    create = AsyncMock(side_effect=[bad, good])
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = await deepseek_ai_manager.generate_structured(
+        client=client,
+        input_text="question",
+        instructions="return an answer",
+        response_model=StructuredAnswer,
+        safety_identifier="user-hash",
+    )
+
+    assert result.data.answer == "fixed"
+    assert create.await_count == 2
+    assert len(create.await_args_list[1].kwargs["messages"]) == 3
+    assert (
+        "was not a valid JSON object"
+        in create.await_args_list[1].kwargs["messages"][2]["content"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_deepseek_structured_prompt_is_strict_and_includes_example() -> None:
+    from domains.characters.schemas import CharacterAIResponse
+
+    completion = SimpleNamespace(
+        id="resp_example",
+        model="deepseek-test",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        '{"text": "Hello!", "rate": {"quality": 10, '
+                        '"correction": "", "comment": ""}}'
+                    )
+                )
+            )
+        ],
+        usage=None,
+    )
+    create = AsyncMock(return_value=completion)
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = await deepseek_ai_manager.generate_structured(
+        client=client,
+        input_text="question",
+        instructions="return an answer",
+        response_model=CharacterAIResponse,
+        safety_identifier="user-hash",
+    )
+
+    assert result.data.text == "Hello!"
+    system = create.await_args.kwargs["messages"][0]["content"]
+    assert "single valid JSON object and nothing else" in system
+    assert "markdown code fences" in system
+    assert "Example of a valid response:" in system
+    assert '"quality": 10' in system
+
+
 def test_selector_returns_configured_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

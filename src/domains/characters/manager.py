@@ -19,6 +19,53 @@ from domains.characters.service import character_chat_service
 from domains.quota.service import token_quota_service
 
 
+# Persona-neutral shared system prompt. It is deliberately generic so that any
+# character (Santa Claus, SpongeBob, Messi, ...) inherits only the common rules:
+# fictional roleplay, English-only, reply shape, and the evaluation format. The
+# character-specific persona comes from the per-character `character_prompt`.
+CHARACTER_BASE_INSTRUCTIONS = (
+    "Roleplay as a clearly fictional AI character described below. Never claim to "
+    "be a real person, never invent private information, and do not imply "
+    "endorsement. The purpose is relaxed English conversation practice. Communicate "
+    "strictly in English, even when the user writes in another language. Stay in "
+    "character at all times, following the supplied character description. Keep the "
+    "character reply in text to one to three short sentences. Ask at most one "
+    "natural follow-up question.\n"
+    "You must answer with exactly one valid JSON object and nothing else: no "
+    "markdown code fences, no commentary, no text before or after, and no trailing "
+    "punctuation. Use exactly these field names with these value types: 'text' is a "
+    "string with the character reply; 'rate' is an object with 'quality' (a JSON "
+    "integer from 0 to 10, never a quoted string), 'correction' (a string, never "
+    "null), and 'comment' (a string, never null). Evaluate only the English quality "
+    "of the user's latest message. If the message is natural and correct, use "
+    "quality 10 and set both correction and comment to empty strings. If it "
+    "contains any meaningful grammar, word-choice, spelling, or naturalness issue, "
+    "use 0-9, put the full natural corrected message in correction, and give a "
+    "short grammar explanation in English in comment. If no correction is needed, "
+    "correction and comment must both be empty. Never fill only one of those "
+    "fields. The comment must be no more than three short sentences.\n"
+    "Valid response example:\n"
+    '{"text": "Nice to meet you! What would you like to talk about?", "rate": '
+    '{"quality": 10, "correction": "", "comment": ""}}'
+)
+
+
+def compose_character_instructions(character: Character) -> str:
+    """Build the effective system prompt for a character.
+
+    New-flow characters use the shared persona-neutral base plus their short
+    description. Legacy characters (no ``character_prompt``) keep their stored
+    ``instructions`` verbatim.
+    """
+    if character.character_prompt is not None:
+        return (
+            CHARACTER_BASE_INSTRUCTIONS
+            + "\n\nCharacter: "
+            + character.character_prompt
+        )
+    return character.instructions or ""
+
+
 class CharacterChatManager:
     async def list_characters(
         self,
@@ -55,7 +102,15 @@ class CharacterChatManager:
         existing = await character_chat_service.get_character(session, payload.id)
         if existing is not None:
             raise ValueError("A character with this ID already exists")
-        character = Character(**payload.model_dump())
+        character = Character(
+            id=payload.id,
+            name=payload.name,
+            description=payload.description,
+            greeting=payload.greeting,
+            instructions=payload.instructions,
+            character_prompt=payload.character_prompt,
+            is_active=payload.is_active,
+        )
         character_chat_service.add_character(session, character)
         await session.flush()
         await session.commit()
@@ -68,8 +123,17 @@ class CharacterChatManager:
         payload: CharacterUpdateRequest,
     ) -> Character:
         character = await self.get_character(session, character_id)
-        for field, value in payload.model_dump().items():
-            setattr(character, field, value)
+        character.name = payload.name
+        character.description = payload.description
+        character.greeting = payload.greeting
+        character.is_active = payload.is_active
+        if payload.character_prompt is not None:
+            character.character_prompt = payload.character_prompt
+            character.instructions = None
+        elif payload.instructions is not None:
+            character.instructions = payload.instructions
+            character.character_prompt = None
+        # else: both prompt fields are None -> keep the existing prompt unchanged.
         await session.flush()
         await session.refresh(character)
         await session.commit()
@@ -165,6 +229,9 @@ class CharacterChatManager:
     ) -> tuple[CharacterMessage, CharacterMessage]:
         conversation = await self.get_conversation(session, conversation_id, user_id)
         character = await self.get_character(session, conversation.character_id)
+        effective_instructions = compose_character_instructions(character)
+        if not effective_instructions.strip():
+            raise AIProviderError("Character has no prompt configured")
         clean_content = content.strip()
         user_message = CharacterMessage(
             conversation_id=conversation.id,
@@ -186,7 +253,7 @@ class CharacterChatManager:
             session,
             user_id,
             user_role,
-            character.instructions,
+            effective_instructions,
             input_text,
         )
 
@@ -194,7 +261,7 @@ class CharacterChatManager:
             result = await ai_manager.generate_structured(
                 client=client,
                 input_text=input_text,
-                instructions=character.instructions,
+                instructions=effective_instructions,
                 response_model=CharacterAIResponse,
                 safety_identifier=self._safety_identifier(user_id),
                 max_output_tokens=max_output_tokens,
@@ -222,7 +289,7 @@ class CharacterChatManager:
             total_tokens=self._accounted_tokens(
                 user_role,
                 result.usage.total_tokens,
-                character.instructions,
+                effective_instructions,
                 input_text,
                 max_output_tokens,
             ),
