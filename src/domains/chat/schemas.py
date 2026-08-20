@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CreateConversationRequest(BaseModel):
@@ -14,7 +14,25 @@ class CreateConversationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    content: str = Field(min_length=1, max_length=20_000)
+    content: str | None = Field(default=None, max_length=20_000)
+    tool_call_id: str | None = Field(default=None, max_length=64)
+    tool_result: str | None = Field(default=None, max_length=100_000)
+
+    @model_validator(mode="after")
+    def _validate_phase_fields(self) -> "SendMessageRequest":
+        if self.tool_call_id is not None or self.tool_result is not None:
+            if self.tool_call_id is None or self.tool_result is None:
+                raise ValueError(
+                    "tool_call_id and tool_result must be provided together"
+                )
+            if self.content is not None and self.content != "":
+                raise ValueError(
+                    "content must be absent when tool_call_id is provided"
+                )
+            return self
+        if self.content is None or self.content == "":
+            raise ValueError("content is required")
+        return self
 
 
 class MessageResponse(BaseModel):
@@ -23,6 +41,7 @@ class MessageResponse(BaseModel):
     id: UUID
     role: Literal["user", "assistant"]
     content: str
+    tool_calls: list[dict] | None = None
     provider: str | None
     provider_host: str | None
     model: str | None

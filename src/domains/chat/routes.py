@@ -2,7 +2,7 @@ import json
 from collections.abc import AsyncIterator
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,6 +73,11 @@ async def send_message(
     openai_client: AsyncOpenAI = Depends(get_openai_client),
     provider_manager: AIManager = Depends(get_ai_manager),
 ) -> ChatTurnResponse:
+    if payload.tool_call_id is not None or payload.tool_result is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tool result continuation is only supported on the stream endpoint",
+        )
     user_message, assistant_message = await chat_manager.send_message(
         session,
         openai_client,
@@ -100,26 +105,59 @@ async def stream_message(
 ) -> StreamingResponse:
     # Preparation happens before the response starts so auth, ownership and quota
     # errors preserve their normal HTTP status codes.
-    prepared = await chat_manager.prepare_message(
-        session,
-        conversation_id,
-        user.id,
-        user.role,
-        payload.content,
-    )
+    if payload.tool_call_id is not None:
+        prepared = await chat_manager.prepare_tool_result(
+            session,
+            conversation_id,
+            user.id,
+            user.role,
+            payload.tool_call_id,
+            payload.tool_result,
+        )
+        is_tool_result_phase = True
+    else:
+        prepared = await chat_manager.prepare_message(
+            session,
+            conversation_id,
+            user.id,
+            user.role,
+            payload.content,
+        )
+        is_tool_result_phase = False
 
     async def events() -> AsyncIterator[str]:
         yield _sse("ready", {})
         try:
-            async for event in chat_manager.stream_prepared_message(
-                session,
-                openai_client,
-                provider_manager,
-                user.id,
-                prepared,
-            ):
+            stream = (
+                chat_manager.stream_prepared_message(
+                    session,
+                    openai_client,
+                    provider_manager,
+                    user.id,
+                    prepared,
+                )
+                if is_tool_result_phase
+                else chat_manager.stream_tool_message(
+                    session,
+                    openai_client,
+                    provider_manager,
+                    user.id,
+                    prepared,
+                )
+            )
+            async for event in stream:
                 if event.delta is not None:
                     yield _sse("delta", {"delta": event.delta})
+                if event.tool_call is not None:
+                    yield _sse(
+                        "tool_call",
+                        {
+                            "id": event.tool_call.id,
+                            "name": event.tool_call.name,
+                            "arguments": event.tool_call.arguments,
+                            "note": event.note or "",
+                        },
+                    )
                 if event.messages is not None:
                     user_message, assistant_message = event.messages
                     turn = ChatTurnResponse(

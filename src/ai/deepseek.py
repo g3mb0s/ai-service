@@ -4,7 +4,14 @@ from collections.abc import AsyncIterator
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from ai.base import AIManager, AIResult, AIStreamEvent, AIUsage, StructuredModelT
+from ai.base import (
+    AIManager,
+    AIResult,
+    AIStreamEvent,
+    AIStreamToolEvent,
+    AIUsage,
+    StructuredModelT,
+)
 from basic_utils.config import settings
 from basic_utils.exceptions import AIProviderError
 from basic_utils.logger import get_logger
@@ -21,14 +28,17 @@ class DeepSeekAIManager(AIManager):
     async def chat(
         self,
         client: AsyncOpenAI,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, object]],
         instructions: str,
         safety_identifier: str,
         max_output_tokens: int | None = None,
     ) -> AIResult[str]:
         request: dict[str, object] = dict(
             model=settings.openai_model,
-            messages=[{"role": "system", "content": instructions}, *messages],
+            messages=[
+                {"role": "system", "content": instructions},
+                *self._chat_completions_messages(messages),
+            ],
             user=safety_identifier,
         )
         if max_output_tokens is not None:
@@ -49,14 +59,17 @@ class DeepSeekAIManager(AIManager):
     async def stream_chat(
         self,
         client: AsyncOpenAI,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, object]],
         instructions: str,
         safety_identifier: str,
         max_output_tokens: int | None = None,
     ) -> AsyncIterator[AIStreamEvent]:
         request: dict[str, object] = dict(
             model=settings.openai_model,
-            messages=[{"role": "system", "content": instructions}, *messages],
+            messages=[
+                {"role": "system", "content": instructions},
+                *self._chat_completions_messages(messages),
+            ],
             user=safety_identifier,
             stream=True,
             stream_options={"include_usage": True},
@@ -86,6 +99,115 @@ class DeepSeekAIManager(AIManager):
         if not content:
             raise AIProviderError("DeepSeek returned an empty response")
         yield AIStreamEvent(
+            result=AIResult(
+                data=content,
+                provider=self.provider,
+                provider_host=settings.openai_base_url,
+                model=response_model,
+                response_id=response_id,
+                usage=self._get_usage(usage),
+            )
+        )
+
+    async def stream_tool_chat(
+        self,
+        client: AsyncOpenAI,
+        messages: list[dict[str, object]],
+        instructions: str,
+        safety_identifier: str,
+        tools: list[dict[str, object]],
+        max_output_tokens: int | None = None,
+    ) -> AsyncIterator[AIStreamToolEvent]:
+        request: dict[str, object] = dict(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": instructions},
+                *self._chat_completions_messages(messages),
+            ],
+            tools=tools,
+            tool_choice="auto",
+            user=safety_identifier,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        if max_output_tokens is not None:
+            request["max_tokens"] = max_output_tokens
+
+        stream = await client.chat.completions.create(**request)
+        pre_tool_parts: list[str] = []
+        # index -> {"id", "name", "arguments"}; id/name берутся из первого чанка
+        # данного index и бэкфиллятся при конкатенации arguments (замечание 3).
+        calls: dict[int, dict[str, str]] = {}
+        call_order: list[int] = []
+        saw_tool_fragment = False
+        response_id: str | None = None
+        response_model = settings.openai_model
+        usage: object | None = None
+        try:
+            async for chunk in stream:
+                response_id = getattr(chunk, "id", None) or response_id
+                response_model = getattr(chunk, "model", None) or response_model
+                usage = getattr(chunk, "usage", None) or usage
+                choices = getattr(chunk, "choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].delta
+                if delta is None:
+                    continue
+                content = getattr(delta, "content", None)
+                tool_calls = getattr(delta, "tool_calls", None)
+                if tool_calls:
+                    saw_tool_fragment = True
+                    for tc in tool_calls:
+                        index = getattr(tc, "index", 0)
+                        entry = calls.get(index)
+                        if entry is None:
+                            entry = {"id": "", "name": "", "arguments": ""}
+                            calls[index] = entry
+                            call_order.append(index)
+                        tc_id = getattr(tc, "id", None)
+                        function = getattr(tc, "function", None)
+                        tc_name = (
+                            getattr(function, "name", None)
+                            if function is not None
+                            else None
+                        )
+                        args_delta = (
+                            getattr(function, "arguments", None)
+                            if function is not None
+                            else None
+                        )
+                        if tc_id:
+                            entry["id"] = tc_id
+                        if tc_name:
+                            entry["name"] = tc_name
+                        if args_delta:
+                            entry["arguments"] += args_delta
+                elif content and not saw_tool_fragment:
+                    pre_tool_parts.append(content)
+                    yield AIStreamToolEvent(delta=content)
+        finally:
+            await stream.close()
+
+        if calls:
+            first_call = calls[call_order[0]]
+            pre_tool_text = "".join(pre_tool_parts)
+            yield AIStreamToolEvent(
+                pre_tool_text=pre_tool_text,
+                tool_call_id=first_call["id"],
+                tool_name=first_call["name"],
+                tool_arguments=first_call["arguments"],
+                usage=self._get_usage(usage),
+                note=pre_tool_text,
+                model=response_model,
+                response_id=response_id,
+            )
+            return
+
+        content = "".join(pre_tool_parts).strip()
+        if not content:
+            raise AIProviderError("DeepSeek returned an empty response")
+        yield AIStreamToolEvent(
             result=AIResult(
                 data=content,
                 provider=self.provider,
@@ -199,6 +321,42 @@ class DeepSeekAIManager(AIManager):
             f"DeepSeek returned invalid structured data for "
             f"{response_model.__name__}"
         ) from last_error
+
+    def _chat_completions_messages(
+        self, messages: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        """Конвертирует канонические tool_calls в формат chat.completions.
+
+        Каноническая форма (как хранится в БД): assistant c
+        ``tool_calls=[{id, name, arguments}]``. Chat Completions (и DeepSeek)
+        ожидает ``tool_calls=[{id, type: "function", function: {name, arguments}}]``.
+        Сообщения ``role: "tool"`` уже в правильном формате.
+        """
+        converted: list[dict[str, object]] = []
+        for message in messages:
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                converted.append(message)
+                continue
+            chat_completions_calls: list[dict[str, object]] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                if "type" in call and "function" in call:
+                    chat_completions_calls.append(call)
+                    continue
+                chat_completions_calls.append(
+                    {
+                        "id": call.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": call.get("name"),
+                            "arguments": call.get("arguments"),
+                        },
+                    }
+                )
+            converted.append({**message, "tool_calls": chat_completions_calls})
+        return converted
 
     def _extract_json_object(self, content: str) -> str:
         cleaned = content.strip()

@@ -8,6 +8,7 @@ from basic_utils.database import async_engine
 from basic_utils.exceptions import (
     AIProviderError,
     DailyTokenLimitError,
+    DomainError,
     EntityNotFoundError,
 )
 from basic_utils.openai_client import close_openai_client
@@ -69,6 +70,16 @@ async def ai_provider_error_handler(
     logger.error("AI provider error", {"error": str(exc)})
     return JSONResponse(
         status_code=status.HTTP_502_BAD_GATEWAY,
+        content={"detail": str(exc)},
+    )
+
+
+@app.exception_handler(DomainError)
+async def domain_error_handler(
+    _request: Request, exc: DomainError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
         content={"detail": str(exc)},
     )
 

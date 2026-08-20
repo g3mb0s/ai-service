@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, Uuid, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from basic_utils.models import Base
@@ -46,6 +47,7 @@ class ChatMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_calls: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
     provider: Mapped[str | None] = mapped_column(String(50))
     provider_host: Mapped[str | None] = mapped_column(String(500))
     model: Mapped[str | None] = mapped_column(String(100))

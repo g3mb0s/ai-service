@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     user_daily_token_limit: int = 50_000
     user_max_output_tokens_per_request: int = 8_000
     character_response_max_output_tokens: int = 800
+    tool_call_note_max_length: int = 2000
     
     # Настройки CORS
     allowed_origins: list[str] = ["*"]
